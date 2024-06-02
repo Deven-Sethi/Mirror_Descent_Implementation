@@ -33,18 +33,160 @@ def vec_trans_mat_vec(x,M):
         '''
         return(torch.sum(torch.matmul(x , M) * x, axis = 1))
 
+
 class LQR_problem_reg():
     def __init__(self, A, B, sigma, M, N, rho, tau):
         self.A = A.float() 
         self.B = B 
         self.sigma = sigma
         self.M = M.float()
-        #self.R = R 
-        self.N = N 
-        #self.P = P 
-        #self.Q = Q
+        self.N = N
         self.rho = rho
         self.tau = tau
+    
+        
+    def generate_from_state_space(self, N):
+        '''
+        generate from the uniform distribution over the state space
+        which we take to be the ball of radius rad
+        '''
+        rand_rad =  5 * torch.sqrt(torch.rand(N))
+        rand_ang =  2 * np.pi * torch.rand(N)
+        x_cord = rand_rad * np.cos(rand_ang)
+        y_cord = rand_rad * np.sin(rand_ang)
+        return(torch.stack((x_cord,y_cord), 1))
+    
+    def generate_from_boundary_state_space(self, N):
+        '''
+        generate from the uniform distribution over the state space
+        which we take to be the ball of radius rad
+        '''
+        rand_ang =  2 * np.pi * torch.rand(N)
+        x_cord = 5 * np.cos(rand_ang)
+        y_cord = 5 * np.sin(rand_ang)
+        return(torch.stack((x_cord,y_cord), 1))
+    
+    def learn_uncontrolled_problem(self, dimX, dimH, lr, num_of_epochs, num_samples):
+        model = NN_for_PDEs.Net_DGM(dim_x = dimX, dim_S = dimH, activation='Tanh')
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss() 
+        pbar = tqdm(total = num_of_epochs)
+
+        learning_loss = [100 for i in range(30)]
+
+        for epoch in range(num_of_epochs):
+            optimizer.zero_grad()
+            #x_samples = self.generate_from_state_space(num_samples)
+            x_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((num_samples,))
+            x_samples.requires_grad = True
+            v = model(x_samples)
+            Dv = get_gradient(v, x_samples)
+            Lap_v = get_laplacian(Dv, x_samples)
+            drift = torch.matmul(x_samples, self.A)
+            forcing = torch.sum(x_samples * x_samples, axis = 1).reshape(num_samples, 1)
+            b_Dv = torch.sum(Dv * drift, axis = 1).reshape(num_samples, 1)
+            pde = 0.5 * self.sigma**2 * Lap_v - self.rho * v + b_Dv + 0.5 * forcing
+
+            target_functional = torch.zeros_like(v)
+            MSE_functional = loss_fn(pde, target_functional)
+            learning_loss.append(MSE_functional.item())
+
+            #boundary_samples = self.generate_from_boundary_state_space(num_samples)
+            #boundary_estimates = model(boundary_samples)
+            #exact_boundary = torch.ones_like(boundary_estimates) * 25
+            #MSE_boundary = loss_fn(boundary_estimates, exact_boundary) 
+            
+            loss = MSE_functional #+ MSE_boundary
+            loss.backward()
+            optimizer.step()
+            pbar.update(1)
+            if epoch%10 == 0:
+                pbar.update(10)
+                pbar.write("Iteration: {}/{}\t MSE functional: {:.4f}".format(epoch, num_of_epochs, MSE_functional.item()))
+                #pbar.write("Iteration: {}/{}\t MSE functional: {:.4f}\t MSE boundary: {:.4f}".format(epoch, num_of_epochs, MSE_functional.item(), MSE_boundary.item()))
+            if np.sum(learning_loss[-30:]) / 15 <= 0.0001:
+                break
+        return(model, learning_loss[30:])
+    
+    def MC_approx_no_control(self, x, MC, steps, dt):
+        integral = 0
+        X0 = x.repeat(MC,1)
+        stopped_times = []
+        for i in range(1,steps):
+            discount = np.exp(-self.rho * i * dt)
+            xMx_2 = 0.5 * torch.sum(X0 * X0, axis =1)
+            integral = integral + discount * (dt/MC) * torch.sum(xMx_2, axis = 0)
+            b_X0 = torch.matmul(X0, self.A)
+            X1 = X0 + dt * b_X0 + self.sigma * np.sqrt(dt) * torch.randn(MC,2)
+            X0 = X1
+        return(integral.item())
+
+    def learn_cost_funct_control_mu(self, dimX, dimH, lr, num_of_epochs, num_samples, num_mu_samples):
+        model = NN_for_PDEs.Net_DGM(dim_x = dimX, dim_S = dimH, activation='Tanh')
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 500, 1000, 1800],gamma=0.1)
+        loss_fn = nn.MSELoss() 
+        pbar = tqdm(total = num_of_epochs)
+        learning_loss = [100 for i in range(30)]
+        for epoch in range(num_of_epochs):
+            optimizer.zero_grad()
+            #x_samples = self.generate_from_state_space(num_samples)
+            x_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((num_samples,))
+            x_samples.requires_grad = True
+            v = model(x_samples)
+            Dv = get_gradient(v, x_samples)
+            Lap_v = get_laplacian(Dv, x_samples)
+            drift = torch.matmul(x_samples, self.A)
+            forcing = torch.sum(x_samples * x_samples, axis = 1).reshape(num_samples, 1)
+            b_Dv = torch.sum(Dv * drift, axis = 1).reshape(num_samples, 1)
+
+            mu_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 0.8 * torch.eye(2)).sample((num_mu_samples,))
+            aB = torch.matmul(mu_samples, self.B)
+            stretch_Dv= Dv.repeat_interleave(num_mu_samples,0).reshape(num_samples,num_mu_samples,2)
+            aNa = 0.5 * torch.sum(torch.matmul(mu_samples, self.N) * mu_samples, axis = 1)
+            int_mu = (1/num_mu_samples) * torch.sum(torch.sum(stretch_Dv * aB.unsqueeze(0), axis = 2) + aNa, axis = 1).reshape(num_samples,1)
+    
+            pde = 0.5 * self.sigma**2 * Lap_v - self.rho * v + b_Dv + 0.5 * forcing + int_mu
+ 
+            target_functional = torch.zeros_like(v)
+            MSE_functional = loss_fn(pde, target_functional)
+            learning_loss.append(MSE_functional.item())
+
+            #boundary_samples = self.generate_from_boundary_state_space(num_samples)
+            #boundary_estimates = model(boundary_samples)
+            #exact_boundary = torch.ones_like(boundary_estimates) * 25
+            #MSE_boundary = loss_fn(boundary_estimates, exact_boundary) 
+            
+            loss = MSE_functional #+ MSE_boundary
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            #pbar.update(1)
+            if epoch%10 == 0:
+                pbar.update(10)
+                pbar.write("Iteration: {}/{}\t MSE functional: {:.4f}".format(epoch, num_of_epochs, MSE_functional.item()))
+                #pbar.write("Iteration: {}/{}\t MSE functional: {:.4f}\t MSE boundary: {:.4f}".format(epoch, num_of_epochs, MSE_functional.item(), MSE_boundary.item()))
+            if np.sum(learning_loss[-30:]) / 30 <= 0.001:
+                break
+        return(model, learning_loss[30:])
+
+    def MC_approx_control_mu(self, x, MC, steps, dt):
+        integral = 0
+        X0 = x.repeat(MC,1)
+        #A_samples_from_X0 = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))
+        for i in range(1,steps):
+            A_samples_from_X0 = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 0.8 * torch.eye(2)).sample((MC,))
+            discount = np.exp(-self.rho * i * dt)
+            xMx_2 = 0.5 * torch.sum(X0 * X0, axis =1)
+            aNa_2 = 0.5 * torch.sum(torch.matmul(A_samples_from_X0, self.N) * A_samples_from_X0, axis = 1)
+            integral = integral + discount * (dt/MC) * torch.sum(xMx_2 + aNa_2, axis = 0)
+            b_X0 = torch.matmul(X0, self.A) + torch.matmul(A_samples_from_X0, self.B) 
+            X1 = X0 + dt * b_X0 + self.sigma * np.sqrt(dt) * torch.randn(MC,2)
+            X0 = X1
+        return(integral.item())
+    
+    
+    
     
     def learn_value_function(self, dimX, dimH, lr, num_of_epochs, num_samples, mu_samples):
         ''' 
@@ -66,7 +208,6 @@ class LQR_problem_reg():
 
         for epoch in range(num_of_epochs):
             optimizer.zero_grad()
-            #train_samples_x = self.generate_from_state_space(num_samples) 
             train_samples_x = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((num_samples,))        
             x_batch = train_samples_x.float()
             x_batch.requires_grad = True
@@ -79,36 +220,24 @@ class LQR_problem_reg():
             AX_trans = torch.matmul(self.A, x_batch.unsqueeze(-1)).reshape(num_samples,2)
             AX_trans_grad_v = torch.sum(AX_trans * grad_train_v_x, axis = 1).reshape(num_samples,1)
             linear_PDE_part = 0.5 * self.sigma**2 * lap_train_v_x - self.rho * train_v_x + 0.5 * x_TM_x + AX_trans_grad_v# + Px
-            
+
             stretched_grad_v = (grad_train_v_x.repeat_interleave(mu_samples, dim = 0)).reshape(num_samples,mu_samples, dimX)
             a_v_grad = torch.sum(stretched_grad_v * A_samples, axis = 2)
-            x_batch_Stretch = x_batch.repeat_interleave(mu_samples, 0).reshape(num_samples, mu_samples,  2)
-            #a_TR_x = torch.sum(a_TR * x_batch_Stretch, axis = 2)
-                        
-            #non_linear_part = torch.log((1 / mu_samples ) * torch.sum(torch.exp(- ( a_v_grad + a_TR_x + Q_A_samples + 0.5 * A_N_A ) / self.tau),axis = 1)).reshape(num_samples,1)
             non_linear_part = torch.log((1 / mu_samples ) * torch.sum(torch.exp(- ( a_v_grad + 0.5 * A_N_A ) / self.tau),axis = 1)).reshape(num_samples,1)
             if torch.isnan(torch.sum(non_linear_part)).item():
                 print('nan')
-
             pde = linear_PDE_part - self.tau * non_linear_part
-
             if torch.isnan(torch.sum(pde)).item():
                 print('nan')
             target_functional = torch.zeros_like(train_v_x)
             MSE_functional = loss_fn(pde, target_functional)
             learning_loss.append(MSE_functional.item())
-
-
-                  
             loss = MSE_functional
             loss.backward()
             optimizer.step()
-
             pbar.update(1)
-
             if np.sum(learning_loss[-30:]) / 25 <= 0.001:
                 break
-            
         return(model_value_funct, learning_loss)
 
 
@@ -121,17 +250,21 @@ class LQR_problem_reg():
         loss_fn = nn.MSELoss() 
         pbar = tqdm(total = num_of_epochs) 
         
-        A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((mu_samples,))
+        #A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((mu_samples,))
         
         
-        A_N_A = torch.sum(torch.matmul(A_samples, self.N.float()) * A_samples, axis = 1)
-        A_NA_sum = torch.sum(A_N_A).item()
-        aB_T = torch.matmul(A_samples, self.B.unsqueeze(0).float()).squeeze()
+        #A_N_A = torch.sum(torch.matmul(A_samples, self.N.float()) * A_samples, axis = 1)
+        #A_NA_sum = torch.sum(A_N_A).item()
+        #aB_T = torch.matmul(A_samples, self.B.unsqueeze(0).float()).squeeze()
         learning_loss = [100 for i in range(30)]
 
         for epoch in range(num_of_epochs):
             optimizer.zero_grad()
             train_samples_x = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((num_samples,))
+            A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((mu_samples,))
+            A_N_A = torch.sum(torch.matmul(A_samples, self.N.float()) * A_samples, axis = 1)
+            A_NA_sum = torch.sum(A_N_A).item()
+            aB_T = torch.matmul(A_samples, self.B.unsqueeze(0).float()).squeeze()
             #train_samples_x = self.generate_from_state_space(num_samples) 
             #train_samples_x = torch.tensor(np.random.uniform(4, 4, (num_samples, 2)))          
             x_batch = train_samples_x.float()
@@ -149,7 +282,7 @@ class LQR_problem_reg():
             a_v_grad_sum = torch.sum(torch.sum(stretched_grad_v * aB_T, axis = 2), axis = 1)
             int_mu = (1 / mu_samples) * ( A_NA_sum + a_v_grad_sum )
 
-            linear_PDE_part = 0.5 * (self.sigma**2)* lap_train_v_x - self.rho * train_v_x + 0.5 * x_TM_x + AX_trans_grad_v + int_mu.reshape(num_samples,1)
+            linear_PDE_part = 0.5 * (self.sigma**2) * lap_train_v_x - self.rho * train_v_x + 0.5 * x_TM_x + AX_trans_grad_v + int_mu.reshape(num_samples,1)
             
             pde = linear_PDE_part
             target_functional = torch.zeros_like(train_v_x)
@@ -160,12 +293,66 @@ class LQR_problem_reg():
             loss.backward()
             optimizer.step()
             pbar.update(1)
-            if np.sum(learning_loss[-30:]) / 20 <= 0.0008:
+            if np.sum(learning_loss[-30:]) / 30 <= 0.008:
+
                 break
             
         return(model_value_funct, learning_loss)
         
-
+    def MC_control_mu(self, x, MC, T, N_time, dt, num_mu_samples, SDE_samples):
+        integral = 0
+        X0 = x.repeat(MC,1)
+        X0.requires_grad = True
+        mu_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((num_mu_samples,))
+        aNa = torch.sum(vec_trans_mat_vec(mu_samples, self.N), axis = 0).item()
+        integral_discounting = (1-np.exp(-(N_time-1)*dt)) / (1-np.exp(-dt))
+        int_mu = integral_discounting * aNa * 0.5 * dt * (1/num_mu_samples)
+        A_trans = self.A.T
+        B_trans = self.B.T
+        def b(X_old,len_X_old,actions,SDE_samples):
+            action_reshape = actions.reshape(len_X_old, SDE_samples, 2)
+            X_stretch = X_old.repeat_interleave(SDE_samples,0).reshape(len_X_old, SDE_samples, 2)
+            return(torch.sum(X_stretch + action_reshape, axis = 1) * (1/SDE_samples))
+        pbar = tqdm(total = N_time) 
+        A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((MC,))
+        for i in range(N_time):
+            # first update the integral
+            discount = np.exp(-self.rho * dt * i)
+            xMx = vec_trans_mat_vec(X0, self.M)
+            aNa = vec_trans_mat_vec(X0, self.N)
+            integral = integral + (dt / MC) * discount * torch.sum(xMx, axis = 0) + int_mu
+            
+            normal_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))
+            A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))
+            #A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), 2 * torch.eye(2)).sample((MC*SDE_samples,))
+            X1 = X0 + b(X0,MC,A_samples,SDE_samples) * dt + self.sigma * np.sqrt(dt) * normal_samples
+            
+            X0 = X1
+            pbar.update(1)
+        return(integral)
+    
+    def MC_control_mu_2(self, x, MC, T, N_time, dt):
+        integral = 0
+        X0 = x.repeat(MC,1)
+        X0.requires_grad = True
+        def b(X_old,actions):
+            return(X_old + actions)
+            #return(X_old+actions)
+        pbar = tqdm(total = N_time) 
+        A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))
+        for i in range(N_time):
+            discount = np.exp(-self.rho * dt * i)
+            xMx = vec_trans_mat_vec(X0, self.M)
+            aNa = vec_trans_mat_vec(A_samples, self.N)
+            integral = integral + (dt / MC) * discount * torch.sum( (xMx + aNa) * 0.5, axis = 0)
+            A_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))
+            normal_samples = multi_norm_sampler.MultivariateNormal(torch.zeros(2), torch.eye(2)).sample((MC,))            
+            X1 = X0 + b(X0,A_samples) * dt + self.sigma * np.sqrt(dt) * normal_samples
+            X0 = X1
+            pbar.update(1)
+        print(integral)
+        print('******')
+        return(integral)
         
     def MC_value_function_approx(self, MC_samples, total_time_Steps, T , initial_cond, model, exact_val):
         # sample O times from mu
@@ -338,27 +525,7 @@ class LQR_problem_reg():
             '''
         return(model,learning_loss)
 
-    
-    def generate_from_state_space(self, N):
-        '''
-        generate from the uniform distribution over the state space
-        which we take to be the ball of radius rad
-        '''
-        rand_rad =  5 * torch.sqrt(torch.rand(N))
-        rand_ang =  2 * np.pi * torch.rand(N)
-        x_cord = rand_rad * np.cos(rand_ang)
-        y_cord = rand_rad * np.sin(rand_ang)
-        return(torch.stack((x_cord,y_cord), 1))
-    
-    def generate_from_boundary_state_space(self, N):
-        '''
-        generate from the uniform distribution over the state space
-        which we take to be the ball of radius rad
-        '''
-        rand_ang =  2 * np.pi * torch.rand(N)
-        x_cord = 5 * np.cos(rand_ang)
-        y_cord = 5 * np.sin(rand_ang)
-        return(torch.stack((x_cord,y_cord), 1))
+
 
     
 
